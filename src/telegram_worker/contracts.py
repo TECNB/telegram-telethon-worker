@@ -58,6 +58,7 @@ class ForwardRequest:
     resource_interval_seconds: float = 3.0
     dry_run: bool = False
     request_id: Optional[str] = None
+    reuse_request_id: Optional[str] = None
 
     @classmethod
     def parse(cls, value: Any) -> "ForwardRequest":
@@ -76,12 +77,17 @@ class ForwardRequest:
         resource_interval = body.get("resourceIntervalSeconds", 3.0)
         dry_run = body.get("dryRun", False)
         request_id = body.get("requestId")
+        reuse_request_id = body.get("reuseRequestId")
         if not isinstance(mark_read, bool):
             raise ValueError("markRead must be a boolean")
         if not isinstance(dry_run, bool):
             raise ValueError("dryRun must be a boolean")
         if request_id is not None and (not isinstance(request_id, str) or not request_id.strip()):
             raise ValueError("requestId must be null or a non-empty string")
+        if reuse_request_id is not None and (
+            not isinstance(reuse_request_id, str) or not reuse_request_id.strip()
+        ):
+            raise ValueError("reuseRequestId must be null or a non-empty string")
         if limit is not None and (
             isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 5000
         ):
@@ -121,6 +127,7 @@ class ForwardRequest:
             resource_interval_seconds=float(resource_interval),
             dry_run=dry_run,
             request_id=request_id.strip() if request_id else None,
+            reuse_request_id=reuse_request_id.strip() if reuse_request_id else None,
         )
 
 
@@ -141,6 +148,7 @@ class BackfillRequest:
     start_mode: str = "continue"
     force_resend: bool = False
     request_id: Optional[str] = None
+    reuse_request_id: Optional[str] = None
 
     @classmethod
     def parse(cls, value: Any) -> "BackfillRequest":
@@ -178,8 +186,13 @@ class BackfillRequest:
         if not isinstance(force_resend, bool):
             raise ValueError("forceResend must be a boolean")
         request_id = body.get("requestId")
+        reuse_request_id = body.get("reuseRequestId")
         if request_id is not None and (not isinstance(request_id, str) or not request_id.strip()):
             raise ValueError("requestId must be null or a non-empty string")
+        if reuse_request_id is not None and (
+            not isinstance(reuse_request_id, str) or not reuse_request_id.strip()
+        ):
+            raise ValueError("reuseRequestId must be null or a non-empty string")
         intervals = (
             body.get("groupIntervalSeconds", 1.0),
             body.get("resourceIntervalSeconds", 3.0),
@@ -202,6 +215,7 @@ class BackfillRequest:
             start_mode=start_mode,
             force_resend=force_resend,
             request_id=request_id.strip() if request_id else None,
+            reuse_request_id=reuse_request_id.strip() if reuse_request_id else None,
         )
 
 

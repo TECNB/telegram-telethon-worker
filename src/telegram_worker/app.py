@@ -151,6 +151,19 @@ class BaselineResult:
     cache_hit: bool = False
 
 
+@dataclass
+class PreparedSelection:
+    kind: str
+    signature: tuple
+    source: Any
+    target: Any
+    source_id: int
+    target_id: int
+    resources: list[ResourceBlock]
+    base_result: dict
+    next_cursor: int
+
+
 @dataclass(frozen=True)
 class ResourceScore:
     message_id: int
@@ -320,8 +333,43 @@ class TelegramForwarder:
         self.state = state
         self.ledger = ledger or DeliveryLedger(state.database_path)
         self.baseline_cache = {}
+        self.prepared_selections: Dict[str, PreparedSelection] = {}
+        self.operation_progress: Dict[str, dict] = {}
         # ponytail: one account is serialized; add per-source locks only if throughput needs it.
         self.lock = asyncio.Lock()
+
+    @staticmethod
+    def _request_signature(request: Any) -> tuple:
+        ignored = {"dry_run", "request_id", "reuse_request_id", "force_resend"}
+        return tuple(
+            (name, value)
+            for name, value in vars(request).items()
+            if name not in ignored
+        )
+
+    def _remember_prepared(self, request: Any, prepared: PreparedSelection) -> None:
+        if not request.request_id:
+            return
+        self.prepared_selections[request.request_id] = prepared
+        while len(self.prepared_selections) > 100:
+            self.prepared_selections.pop(next(iter(self.prepared_selections)))
+
+    def _reusable_selection(self, request: Any, kind: str) -> Optional[PreparedSelection]:
+        prepared = self.prepared_selections.get(request.reuse_request_id or "")
+        if prepared is None or prepared.kind != kind:
+            return None
+        return prepared if prepared.signature == self._request_signature(request) else None
+
+    def _update_progress(self, request_id: Optional[str], **values: Any) -> None:
+        if not request_id:
+            return
+        progress = self.operation_progress.setdefault(request_id, {"phase": "QUEUED"})
+        progress.update(values)
+        while len(self.operation_progress) > 200:
+            self.operation_progress.pop(next(iter(self.operation_progress)))
+
+    def progress(self, request_id: str) -> dict:
+        return self.operation_progress.get(request_id, {"phase": "UNKNOWN"})
 
     def _cached_result(self, request_id: Optional[str], operation: str) -> Optional[dict]:
         if not request_id:
@@ -556,12 +604,129 @@ class TelegramForwarder:
             "groups": group_results,
         }
 
+    async def _send_prepared_selection(
+        self,
+        request: Any,
+        prepared: PreparedSelection,
+    ) -> dict:
+        is_backfill = isinstance(request, BackfillRequest)
+        rate_request = request if not is_backfill else ForwardRequest(
+            source=request.source,
+            target=request.target,
+            limit=None,
+            min_video_duration=request.min_video_duration,
+            min_views=request.min_views,
+            min_forwards=request.min_forwards,
+            resource_mode=request.resource_mode,
+            group_interval_seconds=request.group_interval_seconds,
+            resource_interval_seconds=request.resource_interval_seconds,
+            request_id=request.request_id,
+        )
+        force_resend = is_backfill and request.force_resend
+        delivery_mode = "BACKFILL_FORCE" if force_resend else prepared.kind
+        threshold = prepared.base_result.get("threshold")
+        results = []
+        forwarded_resource_count = 0
+        duplicate_resource_count = 0
+        forwarded_group_count = 0
+        duplicate_group_count = 0
+        forwarded_message_count = 0
+        forwarded_message_ids = []
+        self._update_progress(
+            request.request_id,
+            phase="REUSING_DRY_RUN",
+            selectedResourceCount=len(prepared.resources),
+            processedResourceCount=0,
+        )
+        for index, resource in enumerate(prepared.resources, 1):
+            send_result = await self._send_resource_groups(
+                prepared.target,
+                prepared.source,
+                prepared.source_id,
+                resource,
+                rate_request,
+                delivery_mode,
+                force_resend,
+            )
+            forwarded_group_count += send_result["forwardedGroupCount"]
+            duplicate_group_count += send_result["duplicateGroupCount"]
+            forwarded_message_count += send_result["sentMessageCount"]
+            forwarded_message_ids.extend(
+                message_id
+                for group in send_result["groups"]
+                if group["status"] == "FORWARDED"
+                for message_id in group["sourceMessageIds"]
+            )
+            if send_result["forwardedGroupCount"]:
+                forwarded_resource_count += 1
+                status = "FORWARDED"
+            else:
+                duplicate_resource_count += 1
+                status = "DUPLICATE"
+            results.append(self._resource_result(
+                resource,
+                rate_request,
+                rank=index,
+                status=status,
+                threshold=threshold,
+                send_result=send_result,
+            ))
+            self._update_progress(
+                request.request_id,
+                phase="FORWARDING_RESOURCES",
+                processedResourceCount=index,
+                forwardedResourceCount=forwarded_resource_count,
+                forwardedMessageCount=forwarded_message_count,
+            )
+            if send_result["forwardedGroupCount"]:
+                await asyncio.sleep(request.resource_interval_seconds)
+
+        if is_backfill:
+            if request.start_mode == "continue":
+                self.state.save_backfill_before(prepared.source_id, prepared.next_cursor)
+        else:
+            self.state.save_cursor(prepared.source_id, prepared.next_cursor)
+            if request.mark_read and prepared.resources:
+                await self.client.send_read_acknowledge(
+                    prepared.source, max_id=prepared.next_cursor
+                )
+        result = {
+            **prepared.base_result,
+            "requestId": request.request_id,
+            "dryRun": False,
+            "reusedDryRun": True,
+            "reusedDryRunRequestId": request.reuse_request_id,
+            "selectedResources": results,
+            "forwardResults": results,
+            "duplicateResourceCount": duplicate_resource_count,
+            "forwardedResourceCount": forwarded_resource_count,
+            "forwardedGroupCount": forwarded_group_count,
+            "duplicateGroupCount": duplicate_group_count,
+            "forwardedMessageCount": forwarded_message_count,
+        }
+        if is_backfill:
+            result["nextBackfillBeforeMessageId"] = prepared.next_cursor
+        else:
+            result["matchedMessageIds"] = [
+                message.id for resource in prepared.resources for message in resource.messages
+            ]
+            result["forwardedMessageIds"] = forwarded_message_ids
+            result["nextCursor"] = prepared.next_cursor
+        self._update_progress(request.request_id, phase="COMPLETED")
+        operation = "BACKFILL" if is_backfill else "FORWARD"
+        return self._remember_result(request.request_id, operation, result)
+
     async def backfill(self, request: BackfillRequest) -> Dict[str, Any]:
+        self._update_progress(request.request_id, phase="QUEUED")
         async with self.lock:
             operation = "BACKFILL_DRY_RUN" if request.dry_run else "BACKFILL"
             cached = self._cached_result(request.request_id, operation)
             if cached:
                 return cached
+            prepared = self._reusable_selection(request, "BACKFILL")
+            if prepared is not None and not request.dry_run:
+                return await self._send_prepared_selection(request, prepared)
+            self._update_progress(request.request_id, phase="RESOLVING_CHANNEL")
             source = await self.client.get_entity(request.source)
             if getattr(source, "noforwards", False) and not request.dry_run:
                 raise RuntimeError("来源频道禁止转发，Worker 不会绕过此限制")
@@ -601,6 +766,12 @@ class TelegramForwarder:
                 if message.date < cutoff:
                     break
                 messages.append(message)
+                if len(messages) % 50 == 0:
+                    self._update_progress(
+                        request.request_id,
+                        phase="SCANNING_MESSAGES",
+                        scannedMessages=len(messages),
+                    )
             if not messages:
                 return self._remember_result(request.request_id, operation, {
                     "sourceId": source_id,
@@ -647,6 +818,12 @@ class TelegramForwarder:
                 })
 
             resources = make_resources(messages, request.resource_mode)
+            self._update_progress(
+                request.request_id,
+                phase="RANKING_RESOURCES",
+                scannedMessages=len(messages),
+                discoveredResourceCount=len(resources),
+            )
             rate_request = ForwardRequest(
                 source=request.source,
                 target=request.target,
@@ -672,6 +849,11 @@ class TelegramForwarder:
                 reverse=True,
             )
             selected = ranked[:request.top_resources]
+            self._update_progress(
+                request.request_id,
+                eligibleResourceCount=len(ranked),
+                selectedResourceCount=len(selected),
+            )
             next_before_id = min(message.id for message in messages)
             preview = []
             for index, (resource, _) in enumerate(selected, 1):
@@ -735,6 +917,18 @@ class TelegramForwarder:
                 },
             }
             if request.dry_run:
+                self._remember_prepared(request, PreparedSelection(
+                    kind="BACKFILL",
+                    signature=self._request_signature(request),
+                    source=source,
+                    target=target,
+                    source_id=source_id,
+                    target_id=target_id,
+                    resources=[resource for resource, _ in selected],
+                    base_result=base_result,
+                    next_cursor=next_before_id,
+                ))
+                self._update_progress(request.request_id, phase="COMPLETED")
                 return self._remember_result(request.request_id, operation, base_result)
 
             forward_results = []
@@ -771,12 +965,20 @@ class TelegramForwarder:
                         send_result=send_result,
                     )
                 )
+                self._update_progress(
+                    request.request_id,
+                    phase="FORWARDING_RESOURCES",
+                    processedResourceCount=index,
+                    forwardedResourceCount=forwarded_resource_count,
+                    forwardedMessageCount=forwarded_message_count,
+                )
                 if send_result["forwardedGroupCount"]:
                     await asyncio.sleep(request.resource_interval_seconds)
             if request.start_mode == "continue":
                 self.state.save_backfill_before(source_id, next_before_id)
             for resource, _ in selected:
                 self.state.clear_progress(source_id, self._resource_id(resource))
+            self._update_progress(request.request_id, phase="COMPLETED")
             return self._remember_result(request.request_id, "BACKFILL", {
                 **base_result,
                 "selectedResources": forward_results,
@@ -846,6 +1048,12 @@ class TelegramForwarder:
                 for rate in [resource_rate(resource, request)]
                 if rate is not None
             ]
+            self._update_progress(
+                request.request_id,
+                phase="BUILDING_BASELINE",
+                baselineScannedMessages=len(messages),
+                eligibleResourceCount=len(rates),
+            )
             if len(rates) >= request.baseline_size:
                 break
             if len(messages) >= BASELINE_SOFT_MESSAGE_LIMIT and len(rates) >= minimum_samples:
@@ -874,11 +1082,16 @@ class TelegramForwarder:
         return result
 
     async def forward_unread(self, request: ForwardRequest) -> Dict[str, Any]:
+        self._update_progress(request.request_id, phase="QUEUED")
         async with self.lock:
             operation = "FORWARD_DRY_RUN" if request.dry_run else "FORWARD"
             cached = self._cached_result(request.request_id, operation)
             if cached:
                 return cached
+            prepared = self._reusable_selection(request, "FOLLOW")
+            if prepared is not None and not request.dry_run:
+                return await self._send_prepared_selection(request, prepared)
+            self._update_progress(request.request_id, phase="RESOLVING_CHANNEL")
             source = await self.client.get_entity(request.source)
             if getattr(source, "noforwards", False) and not request.dry_run:
                 raise RuntimeError("来源频道禁止转发，Worker 不会绕过此限制")
@@ -906,6 +1119,12 @@ class TelegramForwarder:
                 source, min_id=cursor, limit=request.limit, reverse=True
             ):
                 messages.append(message)
+                if len(messages) % 20 == 0:
+                    self._update_progress(
+                        request.request_id,
+                        phase="SCANNING_MESSAGES",
+                        scannedMessages=len(messages),
+                    )
             messages = await self._with_anchor_context(
                 source, cursor, messages, request.resource_mode
             )
@@ -935,6 +1154,14 @@ class TelegramForwarder:
             )
             if request.max_resources is not None:
                 candidates = candidates[:request.max_resources]
+            self._update_progress(
+                request.request_id,
+                phase="RANKING_RESOURCES",
+                scannedMessages=sum(len(resource.messages) for resource in scanned_resources),
+                discoveredResourceCount=len(scanned_resources),
+                eligibleResourceCount=len(scored),
+                selectedResourceCount=len(candidates),
+            )
             selected = {id(resource) for resource, _ in candidates}
             ranks = {id(resource): rank for rank, (resource, _) in enumerate(candidates, 1)}
 
@@ -962,7 +1189,7 @@ class TelegramForwarder:
             )
 
             if request.dry_run:
-                return self._remember_result(request.request_id, operation, {
+                dry_result = {
                     "sourceId": source_id,
                     "sourceTitle": getattr(source, "title", None),
                     "sourceUsername": getattr(source, "username", None),
@@ -991,7 +1218,20 @@ class TelegramForwarder:
                     "telegramDataAsOf": now.isoformat(),
                     "targetReconciliation": reconciliation,
                     "appliedRules": self._applied_rules(request),
-                })
+                }
+                self._remember_prepared(request, PreparedSelection(
+                    kind="FOLLOW",
+                    signature=self._request_signature(request),
+                    source=source,
+                    target=target,
+                    source_id=source_id,
+                    target_id=target_id,
+                    resources=[resource for resource, _ in candidates],
+                    base_result=dry_result,
+                    next_cursor=resources[-1].last_id if resources else cursor,
+                ))
+                self._update_progress(request.request_id, phase="COMPLETED")
+                return self._remember_result(request.request_id, operation, dry_result)
 
             matched = []
             forwarded = []
@@ -1001,7 +1241,7 @@ class TelegramForwarder:
             forwarded_group_count = 0
             duplicate_group_count = 0
             forwarded_message_count = 0
-            for resource in resources:
+            for resource_index, resource in enumerate(resources, 1):
                 resource_id = self._resource_id(resource)
                 completed_groups = self.state.completed_groups(source_id, resource_id)
                 delivery_state = self._delivery_state(target_id, source_id, resource)
@@ -1052,6 +1292,13 @@ class TelegramForwarder:
                         send_result=send_result,
                     )
                 )
+                self._update_progress(
+                    request.request_id,
+                    phase="FORWARDING_RESOURCES",
+                    processedResourceCount=resource_index,
+                    forwardedResourceCount=forwarded_resource_count,
+                    forwardedMessageCount=forwarded_message_count,
+                )
                 if send_result["forwardedGroupCount"]:
                     await asyncio.sleep(request.resource_interval_seconds)
 
@@ -1060,6 +1307,7 @@ class TelegramForwarder:
                 await self.client.send_read_acknowledge(source, max_id=resources[-1].last_id)
                 marked_read_through = resources[-1].last_id
             next_cursor = resources[-1].last_id if resources else cursor
+            self._update_progress(request.request_id, phase="COMPLETED")
             return self._remember_result(request.request_id, operation, {
                 "sourceId": source_id,
                 "sourceTitle": getattr(source, "title", None),
@@ -1316,6 +1564,9 @@ def build_app(config: Config, client: TelegramClient) -> web.Application:
             return error_response(error, status=400, code="INVALID_REQUEST")
         return web.json_response(await forwarder.reconcile_target(command))
 
+    async def operation_progress(request: web.Request) -> web.Response:
+        return web.json_response(forwarder.progress(request.match_info["request_id"]))
+
     async def forward_unread(request: web.Request) -> web.Response:
         try:
             command = ForwardRequest.parse(await request.json())
@@ -1333,6 +1584,7 @@ def build_app(config: Config, client: TelegramClient) -> web.Application:
     app.router.add_get("/health", health)
     app.router.add_post("/resolve-source", resolve_source)
     app.router.add_post("/reconcile-target", reconcile_target)
+    app.router.add_get("/operations/{request_id}", operation_progress)
     app.router.add_post("/forward-unread", forward_unread)
     app.router.add_post("/backfill", backfill)
     return app

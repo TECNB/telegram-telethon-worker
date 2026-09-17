@@ -219,10 +219,18 @@ class ForwarderTest(unittest.IsolatedAsyncioTestCase):
             state = StateStore(Path(directory) / "state.json")
             client = BackfillClient()
             forwarder = TelegramForwarder(client, state)
+            preview = await forwarder.backfill(
+                BackfillRequest(
+                    "source", "target", top_resources=1, dry_run=True,
+                    group_interval_seconds=0, resource_interval_seconds=0,
+                    request_id="preview",
+                )
+            )
             first = await forwarder.backfill(
                 BackfillRequest(
                     "source", "target", top_resources=1,
                     group_interval_seconds=0, resource_interval_seconds=0,
+                    reuse_request_id="preview",
                     request_id="first",
                 )
             )
@@ -251,6 +259,10 @@ class ForwarderTest(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertEqual(first["forwardedResourceCount"], 1)
+            self.assertTrue(first["reusedDryRun"])
+            self.assertEqual(preview["selectedResourceCount"], 1)
+            self.assertEqual(forwarder.progress("preview")["phase"], "COMPLETED")
+            self.assertEqual(forwarder.progress("preview")["scannedMessages"], 3)
             self.assertEqual(expanded["selectedResourceCount"], 2)
             self.assertEqual(expanded["duplicateResourceCount"], 1)
             self.assertEqual(expanded["forwardedResourceCount"], 1)
