@@ -1,0 +1,20 @@
+services:
+  telegram-worker:
+    build: .
+    env_file: .env
+    environment:
+      WORKER_HOST: 0.0.0.0
+      TG_SESSION_PATH: /app/data/telegram
+      WORKER_STATE_PATH: /app/data/state.json
+    ports:
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    stop_grace_period: 2m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

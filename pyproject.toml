@@ -1,0 +1,20 @@
+[project]
+name = "telegram-telethon-worker"
+version = "0.2.0"
+description = "Small HTTP worker that forwards matching unread Telegram videos."
+requires-python = ">=3.9"
+dependencies = [
+    "aiohttp==3.13.5",
+    "python-socks[asyncio]==2.7.2",
+    "telethon==1.45.0",
+]
+
+[project.scripts]
+telegram-worker = "telegram_worker.app:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
