@@ -1113,7 +1113,14 @@ class TelegramForwarder:
 
     async def resolve_source(self, request: ResolveSourceRequest) -> dict:
         async with self.lock:
-            source = await self.client.get_entity(request.source)
+            try:
+                source = await self.client.get_entity(request.source)
+            except ValueError:
+                # A user may have joined a private channel in another Telegram client
+                # after this worker session was last active. Refresh dialogs once so
+                # Telethon can resolve the channel ID from its local entity cache.
+                await self.client.get_dialogs()
+                source = await self.client.get_entity(request.source)
             return {
                 "sourceId": utils.get_peer_id(source),
                 "title": getattr(source, "title", None)
@@ -1291,7 +1298,14 @@ def build_app(config: Config, client: TelegramClient) -> web.Application:
             command = ResolveSourceRequest.parse(await request.json())
         except (json.JSONDecodeError, ValueError) as error:
             return error_response(error, status=400, code="INVALID_REQUEST")
-        return web.json_response(await forwarder.resolve_source(command))
+        try:
+            return web.json_response(await forwarder.resolve_source(command))
+        except (ValueError, errors.ChannelPrivateError):
+            return error_response(
+                ValueError("无法访问来源频道，请确认当前 Telegram 账号已加入该频道"),
+                status=400,
+                code="SOURCE_NOT_ACCESSIBLE",
+            )
 
     async def reconcile_target(request: web.Request) -> web.Response:
         try:

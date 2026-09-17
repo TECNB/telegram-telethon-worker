@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 
 SourceRef = Union[int, str]
+PRIVATE_CHANNEL_LINK = re.compile(
+    r"^(?:https?://)?(?:www\.)?t\.me/c/([1-9]\d*)(?:/\d+)?/?(?:\?.*)?$",
+    re.IGNORECASE,
+)
 
 
 def _source(body: dict) -> SourceRef:
@@ -13,7 +18,13 @@ def _source(body: dict) -> SourceRef:
         isinstance(value, int) or isinstance(value, str) and value.strip()
     ):
         raise ValueError("source must be a channel ID or non-empty string")
-    return value.strip() if isinstance(value, str) else value
+    if not isinstance(value, str):
+        return value
+    normalized = value.strip()
+    private_link = PRIVATE_CHANNEL_LINK.fullmatch(normalized)
+    if private_link:
+        return -int(f"100{private_link.group(1)}")
+    return normalized
 
 
 def _target(body: dict) -> str:

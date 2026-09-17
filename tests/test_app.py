@@ -15,6 +15,7 @@ from telegram_worker.app import (
     StateStore,
     TelegramForwarder,
     ReconcileTargetRequest,
+    ResolveSourceRequest,
     load_dotenv,
     media_filename,
     make_resources,
@@ -69,6 +70,12 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(
             ForwardRequest.parse({"source": -1001735089356, "target": "t"}).source,
             -1001735089356,
+        )
+        self.assertEqual(
+            ResolveSourceRequest.parse(
+                {"source": "https://t.me/c/3789958298/602"}
+            ).source,
+            -1003789958298,
         )
         backfill = BackfillRequest.parse({"source": "s", "target": "t"})
         self.assertEqual(backfill.lookback_days, 180)
@@ -313,6 +320,37 @@ class ForwarderTest(unittest.IsolatedAsyncioTestCase):
                 [[3], [2]],
             )
             self.assertIsNone(state.backfill_before(-1000000000123))
+
+    async def test_resolve_source_refreshes_dialogs_for_uncached_private_channel(self):
+        class ResolveClient:
+            def __init__(self):
+                self.resolve_attempts = 0
+                self.refreshed = False
+
+            async def get_entity(self, value):
+                self.asserted_value = value
+                self.resolve_attempts += 1
+                if self.resolve_attempts == 1:
+                    raise ValueError("entity not cached")
+                return PeerChannel(3789958298)
+
+            async def get_dialogs(self):
+                self.refreshed = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = ResolveClient()
+            result = await TelegramForwarder(
+                client, StateStore(Path(directory) / "state.json")
+            ).resolve_source(
+                ResolveSourceRequest.parse(
+                    {"source": "https://t.me/c/3789958298/602"}
+                )
+            )
+
+            self.assertEqual(client.asserted_value, -1003789958298)
+            self.assertEqual(client.resolve_attempts, 2)
+            self.assertTrue(client.refreshed)
+            self.assertEqual(result["sourceId"], -1003789958298)
 
     async def test_empty_backfill_keeps_history_response_shape(self):
         class EmptyBackfillClient:
