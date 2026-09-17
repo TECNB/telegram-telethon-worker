@@ -459,6 +459,7 @@ class TelegramForwarder:
         resource: ResourceBlock,
         request: ForwardRequest,
         delivery_mode: str = "FOLLOW",
+        force_resend: bool = False,
     ) -> dict:
         resource_id = self._resource_id(resource)
         legacy_completed = self.state.completed_groups(source_id, resource_id)
@@ -471,7 +472,7 @@ class TelegramForwarder:
             group_key = self._group_key(unit)
             source_message_ids = [message.id for message in unit.messages]
             delivery = self.ledger.get(target_id, source_id, group_key)
-            if delivery or group_key in legacy_completed:
+            if not force_resend and (delivery or group_key in legacy_completed):
                 if delivery is None:
                     self.ledger.record(
                         target_id=target_id,
@@ -749,7 +750,8 @@ class TelegramForwarder:
                     source_id,
                     resource,
                     rate_request,
-                    "BACKFILL",
+                    "BACKFILL_FORCE" if request.force_resend else "BACKFILL",
+                    request.force_resend,
                 )
                 forwarded_group_count += send_result["forwardedGroupCount"]
                 duplicate_group_count += send_result["duplicateGroupCount"]

@@ -81,6 +81,11 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(backfill.lookback_days, 180)
         self.assertEqual(backfill.top_resources, 10)
         self.assertEqual(backfill.max_messages, 5000)
+        self.assertTrue(
+            BackfillRequest.parse(
+                {"source": "s", "target": "t", "forceResend": True}
+            ).force_resend
+        )
         self.assertEqual(
             BackfillRequest.parse(
                 {"source": "s", "target": "t", "startMode": "latest"}
@@ -235,14 +240,25 @@ class ForwarderTest(unittest.IsolatedAsyncioTestCase):
                     request_id="expanded",
                 )
             )
+            calls_before_force = list(client.forwarded)
+            forced = await forwarder.backfill(
+                BackfillRequest(
+                    "source", "target", top_resources=2, start_mode="latest",
+                    group_interval_seconds=0, resource_interval_seconds=0,
+                    force_resend=True,
+                    request_id="forced",
+                )
+            )
 
             self.assertEqual(first["forwardedResourceCount"], 1)
             self.assertEqual(expanded["selectedResourceCount"], 2)
             self.assertEqual(expanded["duplicateResourceCount"], 1)
             self.assertEqual(expanded["forwardedResourceCount"], 1)
-            self.assertEqual(client.forwarded, [[3], [2]])
+            self.assertEqual(calls_before_force, [[3], [2]])
             self.assertTrue(replayed["replayedResponse"])
-            self.assertEqual(client.forwarded, [[3], [2]])
+            self.assertEqual(forced["forwardedResourceCount"], 2)
+            self.assertEqual(forced["duplicateResourceCount"], 0)
+            self.assertEqual(client.forwarded, [[3], [2], [3], [2]])
 
     async def test_reconcile_target_records_native_manual_forwards(self):
         class ReconcileClient:

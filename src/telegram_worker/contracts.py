@@ -139,6 +139,7 @@ class BackfillRequest:
     resource_interval_seconds: float = 3.0
     dry_run: bool = False
     start_mode: str = "continue"
+    force_resend: bool = False
     request_id: Optional[str] = None
 
     @classmethod
@@ -173,6 +174,9 @@ class BackfillRequest:
         dry_run = body.get("dryRun", False)
         if not isinstance(dry_run, bool):
             raise ValueError("dryRun must be a boolean")
+        force_resend = body.get("forceResend", False)
+        if not isinstance(force_resend, bool):
+            raise ValueError("forceResend must be a boolean")
         request_id = body.get("requestId")
         if request_id is not None and (not isinstance(request_id, str) or not request_id.strip()):
             raise ValueError("requestId must be null or a non-empty string")
@@ -196,6 +200,7 @@ class BackfillRequest:
             resource_interval_seconds=float(intervals[1]),
             dry_run=dry_run,
             start_mode=start_mode,
+            force_resend=force_resend,
             request_id=request_id.strip() if request_id else None,
         )
 
