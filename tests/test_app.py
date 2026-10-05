@@ -178,6 +178,23 @@ class WorkerTest(unittest.TestCase):
             del os.environ["WORKER_TEST_VALUE"]
 
 
+    def test_forward_metadata_only_contains_newly_sent_videos_and_full_caption(self):
+        messages = [SimpleNamespace(id=index, views=0, forwards=0, document=SimpleNamespace(
+            size=100 + index, attributes=[DocumentAttributeFilename(f"part{index}.mp4"),
+            DocumentAttributeVideo(301, 1, 1)])) for index in [1, 2]]
+        resource = ResourceBlock([MessageUnit(messages, "系列标题\n补充说明")])
+        with tempfile.TemporaryDirectory() as directory:
+            forwarder = TelegramForwarder(None, StateStore(Path(directory) / "state.json"))
+            result = forwarder._resource_result(resource, ForwardRequest("source", "target", None, 300),
+                rank=1, status="FORWARDED", send_result={"groups": [
+                    {"status": "FORWARDED", "sourceMessageIds": [1]},
+                    {"status": "DUPLICATE", "sourceMessageIds": [2]}],
+                    "targetMessageIds": [9001, 9002], "sentMessageCount": 1,
+                    "forwardedGroupCount": 1, "duplicateGroupCount": 1})
+        self.assertEqual(result["mediaFiles"], [{"messageId": 1, "filename": "part1.mp4",
+            "size": 101, "caption": "系列标题\n补充说明"}])
+
+
 class ForwarderTest(unittest.IsolatedAsyncioTestCase):
     async def test_backfill_latest_expands_top_n_without_resending_previous_top(self):
         now = datetime.now(timezone.utc)

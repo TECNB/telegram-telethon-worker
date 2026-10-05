@@ -497,6 +497,24 @@ class TelegramForwarder:
                     "groups": send_result["groups"],
                 }
             )
+        sent_source_ids = {
+            message_id
+            for group in (send_result or {}).get("groups", [])
+            if group["status"] == "FORWARDED"
+            for message_id in group["sourceMessageIds"]
+        }
+        result["mediaFiles"] = [
+            {
+                "messageId": message.id,
+                "filename": media_filename(message),
+                "size": getattr(message.document, "size", 0),
+                "caption": resource.caption,
+            }
+            for message in resource.messages
+            if message.id in sent_source_ids
+            and video_duration(message) is not None
+            and media_filename(message)
+        ]
         return result
 
     async def _send_resource_groups(
